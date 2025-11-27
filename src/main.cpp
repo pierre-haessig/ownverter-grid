@@ -34,6 +34,9 @@
 #include "control_factory.h"
 #include "transform.h"
 
+/* Oscilloscope library, to record over time the value of selected variables */
+#include "Scope.h"
+
 #include "zephyr/console/console.h"
 
 /* --------------SETUP AND LOOP FUNCTIONS DECLARATION------------------- */
@@ -205,7 +208,7 @@ void user_interface_task()
 /**
  * Board status display task, called pseudo-periodically.
  * It displays board measurements on the serial monitor
- * 
+ *
  * It also sets the board LED (blinking when POWER_MODE).
  */
 void status_display_task()
@@ -277,7 +280,7 @@ inline void read_measurements()
 	V_high_filt = vHigh_filter.calculateWithReturn(V_high);
 }
 
-/* Compute sinusoidal duty cycles for each phase a,b,c 
+/* Compute sinusoidal duty cycles for each phase a,b,c
 
 CODE TO BE MODIFIED! -> DONE
 Instruction: implement three-phase sinusoidal duty cycles
@@ -285,7 +288,7 @@ Instruction: implement three-phase sinusoidal duty cycles
 inline void compute_duties()
 {
 	// Update inverter phase (∫ω(t).dt, computed with Euler approximation, modulo 2π)
-	float32_t omega = 2*PI*v_freq; // frequency conversion (Hz -> rad/s): ω = 2π.f 
+	float32_t omega = 2*PI*v_freq; // frequency conversion (Hz -> rad/s): ω = 2π.f
 	v_angle = ot_modulo_2pi(v_angle + omega*T_control);
 	// Compute duty cycles: CODE TO BE MODIFIED!  -> DONE
 	duty_a = duty_offset + duty_amplitude * ot_sin(v_angle);
@@ -306,7 +309,7 @@ inline void compute_duties()
 /**
  * This is the code loop of the critical task.
  * It is executed every T_control seconds (100 µs by default).
- * 
+ *
  * Actions:
  * - measure voltage and currents (in subfunction)
  * - compute duty cycle (in subfunction)
