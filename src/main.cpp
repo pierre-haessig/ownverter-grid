@@ -477,6 +477,33 @@ void status_display_task()
  */
 inline void read_measurements()
 {
+	// DC side measurements
+	meas_data = shield.sensors.getLatestValue(I_HIGH);
+	if (meas_data != NO_VALUE) {
+		I_dc = meas_data;
+	}
+
+	meas_data = shield.sensors.getLatestValue(V_HIGH);
+	if (meas_data != NO_VALUE) {
+		V_dc = meas_data;
+	}
+
+	// AC side measurements
+	meas_data = shield.sensors.getLatestValue(V1_LOW);
+	if (meas_data != NO_VALUE) {
+		Vg_abc.a = meas_data;
+	}
+
+	meas_data = shield.sensors.getLatestValue(V2_LOW);
+	if (meas_data != NO_VALUE) {
+		Vg_abc.b = meas_data;
+	}
+
+	meas_data = shield.sensors.getLatestValue(V3_LOW);
+	if (meas_data != NO_VALUE) {
+		Vg_abc.b = meas_data;
+	}
+	// Currents
 	meas_data = shield.sensors.getLatestValue(I1_LOW);
 	if (meas_data != NO_VALUE) {
 		Iabc.a = meas_data;
@@ -490,16 +517,6 @@ inline void read_measurements()
 	meas_data = shield.sensors.getLatestValue(I3_LOW);
 	if (meas_data != NO_VALUE) {
 		Iabc.c = meas_data;
-	}
-
-	meas_data = shield.sensors.getLatestValue(I_HIGH);
-	if (meas_data != NO_VALUE) {
-		I_dc = meas_data;
-	}
-
-	meas_data = shield.sensors.getLatestValue(V_HIGH);
-	if (meas_data != NO_VALUE) {
-		V_dc = meas_data;
 	}
 
 	/* Apply filters */
