@@ -39,7 +39,7 @@
 
 #include "zephyr/console/console.h"
 
-/* --------------SETUP AND LOOP FUNCTIONS DECLARATION------------------- */
+/* -------------- MAIN FUNCTIONS DECLARATION ------------------- */
 
 /* Set up of hardware and software at board startup */
 void setup_routine();
@@ -51,21 +51,6 @@ void status_display_task();
 
 /* Power converter control (critical periodic task) */
 void control_task();
-/* Compute duty cycles (subroutine of control task)*/
-void compute_duties();
-
-/* Read analog measurements (subroutine of control task)*/
-void read_measurements();
-/* Transform three-phase measurements to Clarke & DQ */
-void transform_3ph_measurements(float32_t grid_angle);
-/* Compute inverter voltage */
-void compute_inverter_voltages(float32_t grid_angle);
-/* Monitor currents and return true if too high during successive instants → over_current */
-inline bool over_current_monitor();
-/* Monitor power related variables to allow POWER mode → power_ok */
-inline bool monitor_power();
-/* Clear power error flags */
-void clear_error_flags();
 
 /* -------------- VARIABLES DECLARATIONS------------------- */
 
@@ -249,10 +234,7 @@ void print_scope_record() {
 	printk("end record\n");
 }
 
-/* -------------- SETUP FUNCTIONS -------------------------------*/
-
-
-/***************************** PLL ********************************/
+/* -------------- PLL FUNCTIONS ------------------------------- */
 
 /*Init (reset) PLL state variables and PI controller */
 void setup_PLL() {
@@ -321,9 +303,8 @@ inline void run_grid_PLL() {
 
 /* -------------- SETUP FUNCTION -------------------------------*/
 
-
 /**
- * Setup routine, called at board startup.
+ * Main setup routine, called at board startup.
  * It is used to initialize the board (spin microcontroller and power shield)
  * and the application (set tasks).
  */
@@ -353,7 +334,10 @@ void setup_routine()
 	task.startCritical();
 }
 
-/* --------------LOOP FUNCTIONS (TASKS) ------------------------------- */
+/* -------------- BACKGROUND TASKS ------------------------------- */
+
+/* Clear power and PLL error flags */
+void clear_error_flags();
 
 /**
  * User interface task, running in a loop in the background.
@@ -481,6 +465,8 @@ void status_display_task()
 	task.suspendBackgroundMs(200);
 }
 
+/* -------------- CRITICAL CONTROL TASK & SUBFUNCTIONS ----------------------- */
+
 /* Read measurements from analog sensors, possibly applying some filters,
    through microcontroller ADCs (Analog to Digital Converters).
 
@@ -546,11 +532,11 @@ inline void transform_3ph_measurements(float32_t grid_angle) {
 
 /* Monitor currents and return true if too high during successive instants → over_current */
 inline bool over_current_monitor() {
-	bool over_current = Iabc.a > AC_CURRENT_LIMIT || Iabc.a < -AC_CURRENT_LIMIT ||
+	bool over_current_inst = Iabc.a > AC_CURRENT_LIMIT || Iabc.a < -AC_CURRENT_LIMIT ||
 	    Iabc.b > AC_CURRENT_LIMIT || Iabc.b < -AC_CURRENT_LIMIT ||
 		Iabc.c > AC_CURRENT_LIMIT || Iabc.c < -AC_CURRENT_LIMIT ||
-	    I_dc > DC_CURRENT_LIMIT;
-	if (over_current) {
+	    I_dc > DC_CURRENT_LIMIT; // instantaneous overcurrent
+	if (over_current_inst) {
 		over_current_counter++;
 	}
 	if (over_current_counter >= OVER_CURRENT_COUNTER_LIM) {
@@ -560,7 +546,10 @@ inline bool over_current_monitor() {
 	}
 }
 
-/* Monitor power related variables to allow POWER mode → power_ok */
+/* Monitor power related variables to allow POWER mode → power_ok
+
+depends on Vdc voltage, currents and PLL status
+*/
 inline bool monitor_power() {
 	bool over_current = over_current_monitor();
 	// Memorize overcurrent error flag
@@ -570,7 +559,7 @@ inline bool monitor_power() {
 	// Memorize Vdc low error flag
 	if (V_dc_low) {V_dc_low_flag = true;}
 
-	// return power_ok signal
+	// return power_ok signal, including PLL status
 	return  !V_dc_low && pll_synced && !over_current;
 }
 
@@ -642,9 +631,10 @@ inline void apply_duties()
  * It is executed every T_control seconds (100 µs by default).
  *
  * Actions:
- * - measure voltage and currents (in subfunction)
- * - compute duty cycle (in subfunction)
- * - control the power converter leg (ON/OFF state and duty cycle)
+ * - measure voltage and currents
+ * - compute frequency (PLL)
+ * - compute inverter voltages & duty cycles
+ * - control the power converter leg (ON/OFF state)
  */
 void control_task() {
 
@@ -653,7 +643,7 @@ void control_task() {
 	read_measurements();
 	transform_3ph_measurements(grid_angle);
 
-	// State change logic
+	// Operation mode: state change logic
 	power_ok =  monitor_power();
 	switch (control_mode) {
 		case IDLE_ST:
@@ -677,7 +667,7 @@ void control_task() {
 			break;
 	}
 
-	// State action logic
+	// Operation mode: state action logic
 	switch (control_mode) {
 		case IDLE_ST:
 		case ERROR_ST:
@@ -699,14 +689,13 @@ void control_task() {
 			break;
 	}
 
-	/*Scope variables capture*/
+	// Scope variables capture
 	if (control_count % SCOPE_DECIMATION == 0) {
 		scope.acquire();
 	}
 
 	// Increment time for next iteration
 	control_count++;
-
 }
 
 /**
