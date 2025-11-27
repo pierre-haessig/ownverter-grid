@@ -48,59 +48,277 @@ void setup_routine();
 void user_interface_task();
 /* Displaying board status messages on the serial monitor (slow background task) */
 void status_display_task();
+
 /* Power converter control (critical periodic task) */
 void control_task();
 /* Compute duty cycles (subroutine of control task)*/
 void compute_duties();
+
 /* Read analog measurements (subroutine of control task)*/
 void read_measurements();
+/* Transform three-phase measurements to Clarke & DQ */
+void transform_3ph_measurements(float32_t grid_angle);
+/* Compute inverter voltage */
+void compute_inverter_voltages(float32_t grid_angle);
+/* Monitor currents and return true if too high during successive instants → over_current */
+inline bool over_current_monitor();
+/* Monitor power related variables to allow POWER mode → power_ok */
+inline bool monitor_power();
+/* Clear power error flags */
+void clear_error_flags();
 
 /* -------------- VARIABLES DECLARATIONS------------------- */
 
-static const float32_t T_control = 100e-6F; // Control task period (s)
+/* --- Control task core variables --- */
+static const float32_t T_control = 100e-6F; // Control task period (s) (100µs = 0.1ms)
 static const uint32_t T_control_micro = (uint32_t)(T_control * 1.e6F); // Control task period (integer number of µs)
+static uint32_t control_count = 0; // disctrete time (=counter) of control task
 
-/* SINUSOIDAL SIGNAL GENERATION VARIABLES */
-static float32_t v_freq = 50.0; // inverter voltage frequency (Hz)
-static float32_t v_angle = 0.0; // inverter voltage angle (rad)
-const float32_t freq_increment = 10.0; // frequency up or down increment (Hz)
-static float32_t duty_offset = 0.50; // duty cycle offset. Should be close to 50% to offer maximal amplitude.
-static float32_t duty_amplitude = 0.0; // amplitude for sinusoidal duty cycle
-float32_t duty_increment = 0.05; // duty cycle amplitude up or down increment
-static bool square_wave = false; // whether to use square wave modulation, rather than PWM
+/* --- Power & safety monitoring constants  --- */
+const float32_t GRID_VPK = 21.5F; // Assumed grid voltage amplitude (V) (15.2 Vrms)
+const float32_t AC_CURRENT_LIMIT = 3.0; // Max AC current (A)
+const float32_t DC_CURRENT_LIMIT = 3.0; // Max DC current (A)
+const uint16_t OVER_CURRENT_COUNTER_LIM = 3 ; // Number of successive over current instants before error
+const float32_t V_DC = 60; // Assumed DC voltage (V)
+const float32_t V_DC_MIN = 2*GRID_VPK; // Minimal DC voltage to start the POWER
 
-/* BOARD POWER CONVERSION STATE VARIABLES */
-static bool power_enable = false; // Power conversion state of the leg (PWM activation state)
-static float32_t duty_a, duty_b, duty_c; // three-phase PWM duty cycle (phases a, b, c)
-
-/* Possible modes for the OwnTech board */
-enum serial_interface_menu_mode
-{
-	IDLE_MODE = 0,
-	POWER_MODE
-};
-
-uint8_t mode = IDLE_MODE; // Currently user-requested mode
-
-/* COMMUNICATION AND MEASUREMENT VARIABLES */
+/* --- Measurement and Control variables --- */
 
 uint8_t received_serial_char; // Temporary storage for serial monitor character reception
+static float32_t meas_data; // Temporary storage for measured value
 
-/* Measurement variables */
+// DC side variables
+static float32_t V_dc; // DC bus voltage (V)
+static float32_t I_dc; // Current drawn from the DC bus (A)
 
-static float32_t V_high; // High-side voltage (DC bus)
-static float32_t I_high; // High-side current (DC bus current to the legs)
-// static float32_t Va, Vb, Vc; // AC-side phase voltages
-static float32_t Ia, Ib, Ic; // AC-side phase currents
+// AC side variables
+static three_phase_t Vg_abc; // three-phase measured grid voltages (V)
+static clarke_t Vg_clarke; // alpha-beta grid voltages (V)
+static dqo_t Vg_dq; // dq grid voltages (V)
 
-static float meas_data; // Temporary storage for measured value
+static three_phase_t Iabc; // three-phase measured injected current (A)
+static dqo_t Idq; // dq injected current (A)
 
-/* V_high filter (5ms lowpass)*/
-static LowPassFirstOrderFilter vHigh_filter = controlLibFactory.lowpassfilter(T_control, 5.0e-3F);
-static float32_t V_high_filt; // High-side voltage (DC bus), smoothed by lowpass filter
+static three_phase_t Vi_abc; // three-phase desired inverter voltage (V)
+static dqo_t Vi_dq; // dq desired inverter voltage (V)
+static three_phase_t duty_abc;
 
+// Vdc lowpass filter
+static LowPassFirstOrderFilter vdc_filter = controlLibFactory.lowpassfilter(T_control, 5.0e-3F);
+static float32_t V_dc_filt; // DC bus voltage, lowpass filtered (V)
+static float32_t inv_V_dc_filt; // 1/Vdc, with a 1/V_DC_MIN bound
+
+
+float32_t Vi_ref = 0.0;// Inverter d-voltage reference (V)
+const float32_t VI_STEP = 1.0; // Inverter voltage step (V)
+
+/* --- Power control & safety monitoring variables  --- */
+
+/* Operation mode control (state machine) */
+
+// Possible operation mode change requests
+enum RequestMode {
+	IDLE_REQ, // go to IDLE_ST
+	POWER_REQ // go to POWER_ST, if possible
+};
+
+// Possible operation modes
+enum ControlMode {
+	IDLE_ST, // Idle mode (no power)
+	POWER_ST, // Power mode (PWM active)
+	ERROR_ST // Error mode (no power)
+};
+
+// Main variables for operation mode control
+RequestMode request_mode = IDLE_REQ; // last mode change request
+ControlMode control_mode = IDLE_ST; // present converter operation mode
+static bool power_on = false; // Power conversion status (PWM activation)
+
+// Power safety monitoring variables
+static bool power_ok; // true if POWER mode is fine to run
+static uint16_t over_current_counter; // overcurrent error counter
+static bool over_current_flag; // memory flag for overcurrent
+static bool V_dc_low_flag; // memory flag for low V_high event
+
+/* --- Grid synchronization (PLL) variables --- */
+static bool pll_on = true; // ENABLE/DISABLE grid frequency tracking. If false, w=w0
+
+// PLL state (frequency & phase)
+const  float32_t GRID_FREQ0 = 50.0; // nominal grid frequency (Hz)
+const  float32_t GRID_W0 = 2*PI*GRID_FREQ0; // nominal grid frequency (Hz)
+
+static float32_t grid_freq = GRID_FREQ0; // grid frequency (Hz)
+static float32_t grid_w = GRID_W0; // grid frequency (rad/s)
+static float32_t grid_angle = 0.0; // grid angle (rad)
+const float32_t PLL_DELTAW_BOUND = 0.2 * 2*PI*GRID_FREQ0; // +/- bound on PLL frequency deviation
+
+// PLL monitoring
+static bool pll_synced; // PLL sync status
+static bool pll_phase_ok; // phase error low enough
+static bool pll_freq_ok; // frequency deviation around nominal low enough
+static bool pll_ok; // all PLL deviations low enoug
+static bool pll_unsync_flag; // memory flag for PLL unsync event
+static uint32_t pll_sync_counter; // PLL sync and unsync delay counter
+const uint32_t  PLL_SYNC_COUNTER_TARGET = 10e-3/T_control; // 10 ms sync acceptance delay
+const uint32_t  PLL_UNSYNC_COUNTER_TARGET = 1e-3/T_control; // 1 ms unsync delay
+const float32_t PLL_VQ_SYNC_TOLERANCE = 0.5*GRID_VPK; // Vgrid_Q  voltage tolerance (large due to clipped voltages) (V)
+const float32_t PLL_DELTAW_SYNC_TOLERANCE = 0.5*PLL_DELTAW_BOUND;// deviation tolerance from w0, rad/s
+
+// PLL PI feedback filter and parameters
+const float32_t RISE_TIME_PLL = 3.0F / GRID_FREQ0; // desired PLL rise time (s): 3 periods
+const float32_t WN_PLL = 3.0F / RISE_TIME_PLL; // desired PLL 2nd order natural frequency (rad/s)
+const float32_t XSI_PLL = 0.7F; // desired damping factor
+const float32_t KP_PLL = 2 * WN_PLL * XSI_PLL / GRID_VPK; // Proportional feedback gain
+const float32_t KI_PLL = (WN_PLL * WN_PLL) / GRID_VPK; // Integral feedback gain
+const float32_t TI_PLL = KP_PLL / KI_PLL; // Integral feedback time constant (s)
+static Pid pi_pll; // PI feedback filter of the PLL
+
+/* --- Scope, to record over time the value of selected variables --- */
+
+// Scope variables and parameters
+const uint16_t SCOPE_LENGTH = 100; // number of instants to record
+const uint32_t SCOPE_CHANNELS = 15; // number of variables to record (needs to be coherent with setup_scope!)
+const uint32_t SCOPE_DECIMATION = 2; // acquisition rate decimation, with respect to control task period
+const float32_t SCOPE_PRETRIG = 0.2; // record 20% data before trigger
+
+Scope scope(SCOPE_LENGTH, SCOPE_CHANNELS, T_control*SCOPE_DECIMATION);
+static bool dump_scope_req; // request dump of scope data
+
+// Scope functions: trigger setup, acquire and print
+
+/* Scope triggering function: return true to start acquisition */
+bool scope_trigger() {
+	return pll_on;
+}
+
+/* Scope channels and trigger configuration
+
+with number of channels:
+- all channels: 1+7+10+3+2 = 23
+- no inverter voltages and duties: 1+7+5+2 = 15
+*/
+void setup_scope() {
+	// DC bus voltage (1 ch)
+	scope.connectChannel(V_dc, "Vdc");
+
+	// Grid voltages (7 ch)
+	scope.connectChannel(Vg_abc.a, "Vgrid_a");
+	scope.connectChannel(Vg_abc.b, "Vgrid_b");
+	scope.connectChannel(Vg_abc.c, "Vgrid_c");
+
+	scope.connectChannel(Vg_clarke.alpha, "Vgrid_alpha");
+	scope.connectChannel(Vg_clarke.beta, "Vgrid_beta");
+	scope.connectChannel(Vg_dq.d, "Vgrid_d");
+	scope.connectChannel(Vg_dq.q, "Vgrid_q");
+
+	// Inverter currents (5 ch)
+	scope.connectChannel(Iabc.a, "Ia");
+	scope.connectChannel(Iabc.b, "Ib");
+	scope.connectChannel(Iabc.c, "Ic");
+	scope.connectChannel(Idq.d, "Id");
+	scope.connectChannel(Idq.q, "Iq");
+
+	// Inverter voltages (5 ch)
+	// scope.connectChannel(Vi_abc.a, "Vinv_a");
+	// scope.connectChannel(Vi_abc.b, "Vinv_b");
+	// scope.connectChannel(Vi_abc.c, "Vinv_c");
+	// scope.connectChannel(Vi_dq.d, "Vinv_d");
+	// scope.connectChannel(Vi_dq.q, "Vinv_q");
+
+	// // Duty cycles (3 ch)
+	// scope.connectChannel(duty_abc.a, "duty_a");
+	// scope.connectChannel(duty_abc.b, "duty_b");
+	// scope.connectChannel(duty_abc.c, "duty_c");
+
+	// PLL variables (2 ch)
+	scope.connectChannel(grid_freq, "freq");
+	scope.connectChannel(grid_angle, "angle");
+
+	scope.set_trigger(&scope_trigger);
+	scope.set_pretrig_ratio(SCOPE_PRETRIG);
+	scope.start();
+}
+
+void print_scope_record() {
+	printk("begin record\n");
+	scope.init_dump(); // Init the data dump process
+	while (scope.get_dump_state() != DUMP_FINISHED) {
+		printk("%s", scope.dump());
+		task.suspendBackgroundUs(200);
+	}
+	printk("end record\n");
+}
+
+/* -------------- SETUP FUNCTIONS -------------------------------*/
+
+
+/***************************** PLL ********************************/
+
+/*Init (reset) PLL state variables and PI controller */
+void setup_PLL() {
+	/*State variables*/
+	grid_angle = 0.0;
+	pll_on = true;
+	pll_synced = false;
+	pll_unsync_flag = false;
+	pll_sync_counter = 0;
+
+	// PLL PI feedback filter
+	pi_pll = controlLibFactory.pid(T_control, KP_PLL, TI_PLL, 0.0, 0.0, PLL_DELTAW_BOUND, PLL_DELTAW_BOUND);
+
+	pi_pll.reset(0.0); // init frequency w=w0
+}
+
+/* Update PLL state and frequency */
+inline void run_grid_PLL() {
+	if (pll_on) {
+		// PLL frequency update
+		float32_t grid_deltaw = pi_pll.calculateWithReturn(0, -Vg_dq.q); // -Vq as measurement so that process error = +Vq
+		grid_w = GRID_W0 + grid_deltaw;
+		grid_freq = grid_w/(2*PI);
+		// PLL status monitor
+		pll_phase_ok = Vg_dq.q < PLL_VQ_SYNC_TOLERANCE && Vg_dq.q > -PLL_VQ_SYNC_TOLERANCE; // instantaneous PLL phase error below tolerance
+		pll_freq_ok = grid_deltaw < PLL_DELTAW_SYNC_TOLERANCE && grid_deltaw > -PLL_DELTAW_SYNC_TOLERANCE;
+		pll_ok = pll_phase_ok && pll_freq_ok;
+
+		if (!pll_synced) { // UNSYNCED PLL state
+			if (pll_ok) {
+				pll_sync_counter += 1; // accumulate successive phase_ok
+			}
+			else { // phase || freq not ok
+				pll_sync_counter = 0; // reset counter
+			}
+			// PLL sync state update
+			if (pll_sync_counter >= PLL_SYNC_COUNTER_TARGET) {
+				pll_synced = true;
+				pll_sync_counter = 0; // reset counter for SYNCED state
+			}
+		} else { // SYNCED PLL state
+			if (!pll_ok) {
+				pll_sync_counter += 1; // accumulate successive !phase_ok
+			}
+			else { // phase && freq ok
+				pll_sync_counter = 0; // reset counter
+			}
+			// PLL sync state update
+			if (pll_sync_counter >= PLL_UNSYNC_COUNTER_TARGET) {
+				pll_synced = false;
+				pll_unsync_flag = true; // raise PLL unsync event flag
+				pll_sync_counter = 0; // reset counter
+			}
+		}
+	} // PLL OFF: grid_w stays constant at w0
+	else {
+		grid_w = GRID_W0;
+		pll_sync_counter = 0;
+		pll_synced = false;
+	}
+	// update angle (always, no matter PLL ON/OFF status)
+	grid_angle = ot_modulo_2pi(grid_angle + grid_w*T_control);
+}
 
 /* -------------- SETUP FUNCTION -------------------------------*/
+
 
 /**
  * Setup routine, called at board startup.
@@ -109,7 +327,7 @@ static float32_t V_high_filt; // High-side voltage (DC bus), smoothed by lowpass
  */
 void setup_routine()
 {
-	spin.led.turnOn(); // Blink LED at board startup
+	spin.led.turnOn(); // LED ON at board startup
 
 	/* Set the high switch convention for all legs */
 	shield.power.initBuck(ALL);
@@ -118,6 +336,9 @@ void setup_routine()
 
 	/* Setup all the measurements */
 	shield.sensors.enableDefaultOwnverterSensors();
+
+	setup_scope();
+	setup_PLL();
 
 	/* Declare tasks */
 	uint32_t app_task_number = task.createBackground(status_display_task);
@@ -141,66 +362,54 @@ void setup_routine()
  */
 void user_interface_task()
 {
+	// Task content
 	received_serial_char = console_getchar();
 	switch (received_serial_char) {
 	case 'h':
-		/* ----------SERIAL INTERFACE MENU----------------------- */
-
-		printk( " ______________________________________________ \n"
-				"|     ------- MENU ---------                   |\n"
-				"|     press i   : idle mode                    |\n"
-				"|     press p   : power mode                   |\n"
-				"|     press s   : toggle square wave mode      |\n"
-				"|     press u/o : duty cycle ampl./offset UP   |\n"
-				"|     press j/l : duty cycle ampl./offset DOWN |\n"
-				"|     press f   : frequency UP                 |\n"
-				"|     press v   : frequency DOWN               |\n"
-				"|______________________________________________|\n\n");
-
-		/* ------------------------------------------------------ */
+		printk("Command help\n");
+		printk("- p/i: Request Power/Idle mode change\n");
+		printk("- a:   Clear (Acknowledge) power error flags\n");
+		printk("- l:   Toggle PLL ON/OFF\n");
+		printk("- u/j: Increase/Decrease voltage reference by (%.1f) V\n", (double)VI_STEP);
+		printk("- s:   Retreive latest scope data\n");
+		printk("- r:   Relaunch scope acquisition\n");
+		break;
+	// Operation mode
+	case 'p':
+		printk("POWER mode requested\n");
+		request_mode = POWER_REQ;
 		break;
 	case 'i':
-		printk("Idle mode request\n");
-		mode = IDLE_MODE;
+		printk("IDLE mode requested\n");
+		request_mode = IDLE_REQ;
 		break;
-	case 'p':
-		printk("Power mode request\n");
-		mode = POWER_MODE;
+	case 'a':
+		printk("Clearing power error flags\n");
+		clear_error_flags();
 		break;
-	case 's':
-		if (square_wave) {
-			printk("Toggle PWM modulation\n");
-			square_wave = false;
-		} else {
-			printk("Togggle square wave modulation\n");
-			square_wave = true;
-		}
-		break;
-	case 'u':
-		duty_amplitude += duty_increment;
-		printk("Duty cycle amplitude UP (%.2f) \n", (double) duty_amplitude);
-		break;
-	case 'j':
-		duty_amplitude -= duty_increment;
-		printk("Duty cycle amplitude DOWN (%.2f) \n", (double) duty_amplitude);
-		break;
-	case 'o':
-		duty_offset += duty_increment;
-		printk("Duty cycle offset UP (%.2f) \n", (double) duty_offset);
-		break;
+	// PLL toggle
 	case 'l':
-		duty_offset -= duty_increment;
-		printk("Duty cycle offset DOWN (%.2f) \n", (double) duty_offset);
+		if (pll_on) {pll_on = false;}
+		else {pll_on = true;}
+		printk("PLL toggled %s\n", pll_on ? "ON" : "OFF");
 		break;
-	case 'f':
-		v_freq += freq_increment;
-		printk("Frequency UP (%.2f Hz) \n", (double) v_freq);
+	// Setpoint changes
+	case 'u':
+		printk("Voltage reference UP\n");
+		Vi_ref += VI_STEP;
+        break;
+    case 'j':
+		printk("Voltage reference DOWN\n");
+        Vi_ref -= VI_STEP;
+        break;
+	// Scope
+	case 's':
+		printk("Retreive latest scope data\n");
+		dump_scope_req = true;
 		break;
-	case 'v':
-		v_freq -= freq_increment;
-		printk("Frequency DOWN (%.2f Hz) \n", (double) v_freq);
-		break;
-	default:
+	case 'r':
+		printk("Relaunch scope acquisition\n");
+		scope.start();
 		break;
 	}
 }
@@ -209,35 +418,53 @@ void user_interface_task()
  * Board status display task, called pseudo-periodically.
  * It displays board measurements on the serial monitor
  *
- * It also sets the board LED (blinking when POWER_MODE).
+ * It also sets the board LED (blinking when POWER_MODE)
+ * and print (dump) scope data when requested
  */
 void status_display_task()
 {
-	if (mode == IDLE_MODE) {
+	if (control_mode == IDLE_ST) {
 		spin.led.turnOn(); // Constantly ON led when IDLE
 		// Display state:
 		printk("IDL: ");
 
-	} else if (mode == POWER_MODE) {
+	} else if (control_mode == POWER_ST) {
 		spin.led.toggle(); // Blinking LED when POWER
 		// Display state:
 		printk("POW: ");
 	}
-	// Display duty cycle references (if not square wave):
-	if (!square_wave) {
-		printk("duty a=%3.0f%% o=%3.0f%% ",
-		(double) (duty_amplitude*100),
-		(double) (duty_offset*100)
-	);
-	} else {
-		printk("square ");
+	// PLL display:
+	printk("PLL %s (%s %.0f Hz) | ", pll_on ? "ON ":"OFF", pll_synced ? "SYNCED":"UNSYNC", (double) grid_freq);
+	// Display various measurements
+	printk("Vgd %4.1f V", (double) Vg_dq.d);
+	printk("Idq %7.2f,%7.2f A,", (double)Idq.d, (double)Idq.d);
+	printk("Vdc %5.2f V |", (double) V_dc);
+	// Error flags display:
+	if (over_current_flag || V_dc_low_flag || pll_unsync_flag) {
+		printk("Err:");
+		if (over_current_flag) {
+			printk("OC ");
+		}
+		if (V_dc_low_flag) {
+			printk("VDC ");
+		}
+		if (pll_unsync_flag) {
+			printk("PLL");
+		}
 	}
-	printk("@%.0f Hz ", (double) v_freq);
-	printk("| ");
-	// Display measurements
-	printk("Vh %5.2f V, ", (double) V_high);
-	printk("Ih %4.2f A, ", (double) I_high);
 	printk("\n");
+
+	/* Print scope data, if requested */
+	if (dump_scope_req) {
+		if (scope.acq_state() == ACQ_DONE) {
+			print_scope_record();
+		}
+		else {
+			printk("Scope acquisition not DONE, no data to dump\n");
+		}
+		dump_scope_req = false;
+	}
+
 	task.suspendBackgroundMs(200);
 }
 
@@ -245,65 +472,139 @@ void status_display_task()
    through microcontroller ADCs (Analog to Digital Converters).
 
    Measured signals:
-   - currents: Ia, Ib, Ic, I_high
-   - voltages: V_high (with smoothed lowpass filtered version)
+   - currents: Iabc, I_dc
+   - voltages: Vg_abc, V_dc (with V_dc lowpass filtered version)
  */
 inline void read_measurements()
 {
 	meas_data = shield.sensors.getLatestValue(I1_LOW);
 	if (meas_data != NO_VALUE) {
-		Ia = meas_data;
+		Iabc.a = meas_data;
 	}
 
 	meas_data = shield.sensors.getLatestValue(I2_LOW);
 	if (meas_data != NO_VALUE) {
-		Ib = meas_data;
+		Iabc.b = meas_data;
 	}
 
 	meas_data = shield.sensors.getLatestValue(I3_LOW);
 	if (meas_data != NO_VALUE) {
-		Ic = meas_data;
+		Iabc.c = meas_data;
 	}
 
 	meas_data = shield.sensors.getLatestValue(I_HIGH);
 	if (meas_data != NO_VALUE) {
-		I_high = meas_data;
+		I_dc = meas_data;
 	}
 
 	meas_data = shield.sensors.getLatestValue(V_HIGH);
 	if (meas_data != NO_VALUE) {
-		V_high = meas_data;
+		V_dc = meas_data;
 	}
 
 	/* Apply filters */
-	// Smooth V_high (lowpass)
-	V_high_filt = vHigh_filter.calculateWithReturn(V_high);
+	// Smooth V_dc (lowpass)
+	V_dc_filt = vdc_filter.calculateWithReturn(V_dc);
 }
 
-/* Compute sinusoidal duty cycles for each phase a,b,c
+/* Transform three-phase measurements to Clarke & DQ */
+inline void transform_3ph_measurements(float32_t grid_angle) {
+	Vg_clarke  = Transform::clarke(Vg_abc);
+	Vg_dq = Transform::rotation_to_dqo(Vg_clarke, grid_angle);
+	Idq = Transform::to_dqo(Iabc, grid_angle);
+}
 
-CODE TO BE MODIFIED! -> DONE
-Instruction: implement three-phase sinusoidal duty cycles
+/* Monitor currents and return true if too high during successive instants → over_current */
+inline bool over_current_monitor() {
+	bool over_current = Iabc.a > AC_CURRENT_LIMIT || Iabc.a < -AC_CURRENT_LIMIT ||
+	    Iabc.b > AC_CURRENT_LIMIT || Iabc.b < -AC_CURRENT_LIMIT ||
+		Iabc.c > AC_CURRENT_LIMIT || Iabc.c < -AC_CURRENT_LIMIT ||
+	    I_dc > DC_CURRENT_LIMIT;
+	if (over_current) {
+		over_current_counter++;
+	}
+	if (over_current_counter >= OVER_CURRENT_COUNTER_LIM) {
+		return true;
+	} else {
+		return false;
+	}
+}
+
+/* Monitor power related variables to allow POWER mode → power_ok */
+inline bool monitor_power() {
+	bool over_current = over_current_monitor();
+	// Memorize overcurrent error flag
+	if (over_current) {over_current_flag = true;}
+
+	bool V_dc_low = V_dc_filt < V_DC_MIN;
+	// Memorize Vdc low error flag
+	if (V_dc_low) {V_dc_low_flag = true;}
+
+	// return power_ok signal
+	return  !V_dc_low && pll_synced && !over_current;
+}
+
+/* Clear power and PLL error flags */
+void clear_error_flags() {
+	over_current_flag = false;
+	V_dc_low_flag = false;
+	pll_unsync_flag = false;
+}
+
+/* Compute inverter voltage.
+
+In this open loop version, it is juste equal Vd set point.
+In close loop current control version, it will depend on the current set point and measurement */
+void compute_inverter_voltages(float32_t grid_angle) {
+	Vi_dq.d = Vi_ref;
+	Vi_dq.q = 0.0F;
+	// Transform back to abc
+	Vi_abc = Transform::to_threephase(Vi_dq, grid_angle);
+}
+
+/* Convert inverter leg voltage to duty cycle, including saturation
+
+Leg voltage in the [-Vdc/2, +Vdc/2] interval is mapped to [0,1],
+meaning that the duty cycle offset is added automatically.
 */
+inline float32_t voltage_to_duty(float32_t Vleg, float32_t inverse_Vhigh)
+{
+	static float32_t duty_raw;
+	const float32_t duty_offset = 0.5F;
+	duty_raw = Vleg * inverse_Vhigh + duty_offset;
+	if (duty_raw > 1.0F) {
+		return 1.0F;
+	}
+	else if (duty_raw < 0.0F) {
+		return 0.0F;
+	}
+	else {
+		return duty_raw;
+	}
+}
+
+/* Compute duty_abc from Vi_abc and V_high_filtered */
 inline void compute_duties()
 {
-	// Update inverter phase (∫ω(t).dt, computed with Euler approximation, modulo 2π)
-	float32_t omega = 2*PI*v_freq; // frequency conversion (Hz -> rad/s): ω = 2π.f
-	v_angle = ot_modulo_2pi(v_angle + omega*T_control);
-	// Compute duty cycles: CODE TO BE MODIFIED!  -> DONE
-	duty_a = duty_offset + duty_amplitude * ot_sin(v_angle);
-	duty_b = duty_offset + duty_amplitude * ot_sin(v_angle - 2.0/3.0*PI);
-	duty_c = duty_offset + duty_amplitude * ot_sin(v_angle - 4.0/3.0*PI);
-
-	// Square wave inverter variant
-	if (square_wave) {
-		if (v_angle <= PI) duty_a = 1.0;
-		else duty_a = 0.0;
-		if (ot_modulo_2pi(v_angle - 2.0/3.0*PI) <= PI) duty_b = 1.0;
-		else duty_b = 0.0;
-		if (ot_modulo_2pi(v_angle - 4.0/3.0*PI) <= PI) duty_c = 1.0;
-		else duty_c = 0.0;
+	// Invert Vdc with a bound
+	if (V_dc_filt > V_DC_MIN ) {
+		inv_V_dc_filt = 1.0F / V_dc_filt;
 	}
+	else {
+		inv_V_dc_filt = 1.0F / V_dc_filt;
+	}
+
+	duty_abc.a = voltage_to_duty(Vi_abc.a, inv_V_dc_filt);
+	duty_abc.b = voltage_to_duty(Vi_abc.b, inv_V_dc_filt);
+	duty_abc.c = voltage_to_duty(Vi_abc.c, inv_V_dc_filt);
+}
+
+/* Apply legs duty cycles to the PWM generators */
+inline void apply_duties()
+{
+	shield.power.setDutyCycle(LEG1, duty_abc.a);
+	shield.power.setDutyCycle(LEG2, duty_abc.b);
+	shield.power.setDutyCycle(LEG3, duty_abc.c);
 }
 
 /**
@@ -315,31 +616,67 @@ inline void compute_duties()
  * - compute duty cycle (in subfunction)
  * - control the power converter leg (ON/OFF state and duty cycle)
  */
-void control_task()
-{
-	/* Retrieve sensor values */
+void control_task() {
+
+	// Signal processing operations: measurements, monitoring and PLL
+	run_grid_PLL(); // Note: chicken and egg problem about which angle to use to Park-transform Vgrid and which Vg.q to use for PLL
 	read_measurements();
+	transform_3ph_measurements(grid_angle);
 
-	/* Compute sinusoidal duty cycles*/
-	compute_duties();
-
-	/* Manage POWER/IDLE modes */
-	if (mode == IDLE_MODE) {
-		if (power_enable == true) {
-			shield.power.stop(ALL);
-		}
-		power_enable = false;
-	} else if (mode == POWER_MODE) {
-		/* Set duty cycles of all three legs */
-		shield.power.setDutyCycle(LEG1, duty_a);
-		shield.power.setDutyCycle(LEG2, duty_b);
-		shield.power.setDutyCycle(LEG3, duty_c);
-		/* Set POWER ON */
-		if (!power_enable) {
-			power_enable = true;
-			shield.power.start(ALL);
-		}
+	// State change logic
+	power_ok =  monitor_power();
+	switch (control_mode) {
+		case IDLE_ST:
+			if ((request_mode == POWER_REQ) && power_ok) {
+				control_mode = POWER_ST;
+			}
+			break;
+		case POWER_ST:
+			if (!power_ok) {
+				control_mode = ERROR_ST;
+			} else if (request_mode == IDLE_REQ) {
+				control_mode = IDLE_ST;
+			}
+			break;
+		case ERROR_ST:
+			if (request_mode == IDLE_REQ) {
+				// automatically reset error flags and counters when going to IDLE
+				clear_error_flags();
+				control_mode = IDLE_ST;
+			}
+			break;
 	}
+
+	// State action logic
+	switch (control_mode) {
+		case IDLE_ST:
+		case ERROR_ST:
+			// Stop power if it's ON
+			if (power_on) {
+				shield.power.stop(ALL);
+				power_on = false;
+			}
+			break;
+		case POWER_ST:
+			compute_inverter_voltages(grid_angle);
+			compute_duties();
+			apply_duties();
+			// Start power if it's OFF
+			if (!power_on) {
+				power_on = true;
+				shield.power.start(ALL);
+			}
+			break;
+	}
+
+	/*Scope variables capture*/
+	if (control_count % SCOPE_DECIMATION == 0) {
+		scope.acquire();
+	}
+
+	// Increment time for next iteration
+	control_count++;
+
 }
 
 /**
