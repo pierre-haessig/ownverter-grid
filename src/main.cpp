@@ -19,7 +19,7 @@
 
 /**
  * @brief  Application for islanded inverter (open loop),
- *         with fixed, adjustable amplitude and frequency,
+ *         with grid synchronization (PLL)
  *         using the three-phase OwnVerter board.
  *
  * @author Pierre Haessig <pierre.haessig@centralesupelec.fr>
@@ -150,7 +150,7 @@ const  float32_t GRID_W0 = 2*PI*GRID_FREQ0; // nominal grid frequency (Hz)
 static float32_t grid_freq = GRID_FREQ0; // grid frequency (Hz)
 static float32_t grid_w = GRID_W0; // grid frequency (rad/s)
 static float32_t grid_angle = 0.0; // grid angle (rad)
-const float32_t PLL_DELTAW_BOUND = 0.2 * 2*PI*GRID_FREQ0; // +/- bound on PLL frequency deviation
+const float32_t PLL_DELTAW_BOUND = 0.2 * 2*PI*GRID_FREQ0; // +/- bound on PLL frequency deviation: 0.2 F0 = 10 Hz
 
 // PLL monitoring
 static bool pll_synced; // PLL sync status
@@ -176,10 +176,10 @@ static Pid pi_pll; // PI feedback filter of the PLL
 /* --- Scope, to record over time the value of selected variables --- */
 
 // Scope variables and parameters
-const uint16_t SCOPE_LENGTH = 100; // number of instants to record
+const uint16_t SCOPE_LENGTH = 200; // number of instants to record
 const uint32_t SCOPE_CHANNELS = 15; // number of variables to record (needs to be coherent with setup_scope!)
 const uint32_t SCOPE_DECIMATION = 2; // acquisition rate decimation, with respect to control task period
-const float32_t SCOPE_PRETRIG = 0.2; // record 20% data before trigger
+const float32_t SCOPE_PRETRIG = 5.0/40.0; // record 12.5% samples before trigger (5 ms)
 
 Scope scope(SCOPE_LENGTH, SCOPE_CHANNELS, T_control*SCOPE_DECIMATION);
 static bool dump_scope_req; // request dump of scope data
@@ -264,7 +264,7 @@ void setup_PLL() {
 	pll_sync_counter = 0;
 
 	// PLL PI feedback filter
-	pi_pll = controlLibFactory.pid(T_control, KP_PLL, TI_PLL, 0.0, 0.0, PLL_DELTAW_BOUND, PLL_DELTAW_BOUND);
+	pi_pll = controlLibFactory.pid(T_control, KP_PLL, TI_PLL, 0.0, 0.0, -PLL_DELTAW_BOUND, PLL_DELTAW_BOUND);
 
 	pi_pll.reset(0.0); // init frequency w=w0
 }
@@ -273,9 +273,8 @@ void setup_PLL() {
 inline void run_grid_PLL() {
 	if (pll_on) {
 		// PLL frequency update
-		float32_t grid_deltaw = pi_pll.calculateWithReturn(0, -Vg_dq.q); // -Vq as measurement so that process error = +Vq
+		float32_t grid_deltaw = pi_pll.calculateWithReturn(0, -Vg_dq.q); // Delta w. use -Vq as measurement so that process error = +Vq
 		grid_w = GRID_W0 + grid_deltaw;
-		grid_freq = grid_w/(2*PI);
 		// PLL status monitor
 		pll_phase_ok = Vg_dq.q < PLL_VQ_SYNC_TOLERANCE && Vg_dq.q > -PLL_VQ_SYNC_TOLERANCE; // instantaneous PLL phase error below tolerance
 		pll_freq_ok = grid_deltaw < PLL_DELTAW_SYNC_TOLERANCE && grid_deltaw > -PLL_DELTAW_SYNC_TOLERANCE;
@@ -295,7 +294,7 @@ inline void run_grid_PLL() {
 			}
 		} else { // SYNCED PLL state
 			if (!pll_ok) {
-				pll_sync_counter += 1; // accumulate successive !phase_ok
+				pll_sync_counter += 1; // accumulate successive !pll_ok
 			}
 			else { // phase && freq ok
 				pll_sync_counter = 0; // reset counter
@@ -312,9 +311,12 @@ inline void run_grid_PLL() {
 		grid_w = GRID_W0;
 		pll_sync_counter = 0;
 		pll_synced = false;
+		pi_pll.reset(0.0);
 	}
 	// update angle (always, no matter PLL ON/OFF status)
 	grid_angle = ot_modulo_2pi(grid_angle + grid_w*T_control);
+	// Hz frequency output
+	grid_freq = grid_w/(2*PI);
 }
 
 /* -------------- SETUP FUNCTION -------------------------------*/
@@ -423,25 +425,36 @@ void user_interface_task()
  */
 void status_display_task()
 {
-	if (control_mode == IDLE_ST) {
-		spin.led.turnOn(); // Constantly ON led when IDLE
-		// Display state:
-		printk("IDL: ");
+	// Operation mode display
+	switch (control_mode) {
+		case IDLE_ST:
+			spin.led.turnOn(); // Constantly ON led when IDLE
+			printk("IDL: ");
+			break;
 
-	} else if (control_mode == POWER_ST) {
-		spin.led.toggle(); // Blinking LED when POWER
-		// Display state:
-		printk("POW: ");
+		case POWER_ST:
+			spin.led.toggle(); // Blinking LED when POWER
+			printk("POW: ");
+			break;
+
+		case ERROR_ST:
+			spin.led.turnOn(); // Short flash LED when ERROR
+			printk("ERR: ");
+			spin.led.turnOff();
+			break;
 	}
+
 	// PLL display:
-	printk("PLL %s (%s %.0f Hz) | ", pll_on ? "ON ":"OFF", pll_synced ? "SYNCED":"UNSYNC", (double) grid_freq);
+	printk("PLL %s (%s %.1f Hz) | ", pll_on ? "ON ":"OFF", pll_synced ? "SYNCED":"UNSYNC", (double) grid_freq);
 	// Display various measurements
-	printk("Vgd %4.1f V", (double) Vg_dq.d);
-	printk("Idq %7.2f,%7.2f A,", (double)Idq.d, (double)Idq.d);
-	printk("Vdc %5.2f V |", (double) V_dc);
+	printk("Vgd %4.1f V, ", (double) Vg_dq.d);
+	printk("Idq %5.1f,%5.1f A, ", (double)Idq.d, (double)Idq.d);
+	printk("Vdc %5.2f V | ", (double) V_dc);
+	// Scope
+	printk("Scope acq %s | ", scope.acq_state() == ACQ_DONE ? "DONE" : "....");
 	// Error flags display:
 	if (over_current_flag || V_dc_low_flag || pll_unsync_flag) {
-		printk("Err:");
+		printk("Err: ");
 		if (over_current_flag) {
 			printk("OC ");
 		}
@@ -501,7 +514,7 @@ inline void read_measurements()
 
 	meas_data = shield.sensors.getLatestValue(V3_LOW);
 	if (meas_data != NO_VALUE) {
-		Vg_abc.b = meas_data;
+		Vg_abc.c = meas_data;
 	}
 	// Currents
 	meas_data = shield.sensors.getLatestValue(I1_LOW);
