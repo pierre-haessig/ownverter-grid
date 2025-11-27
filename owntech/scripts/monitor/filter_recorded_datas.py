@@ -1,4 +1,4 @@
-##  Copyright (c) 2021-2024 LAAS-CNRS
+##  Copyright (c) 2021-2025 LAAS-CNRS, CentraleSupélec
 #
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU Lesser General Public License as published by
@@ -35,6 +35,7 @@ except ImportError:
     env.Execute("$PYTHONEXE -m pip install numpy")
 try:
     import matplotlib.pyplot as plt
+    import matplotlib as mpl
 except ImportError:
     env.Execute("$PYTHONEXE -m pip install matplotlib")
 try:
@@ -96,7 +97,7 @@ class RecordedDatas(DeviceMonitorFilterBase):
                 data_frame = self.to_dataFrame(file_to_record+".txt")
                 data_frame.to_csv(file_to_record+".csv")
                 figure = self.plot_df(data_frame)
-                figure.savefig(file_to_record+".png")
+                figure.savefig(file_to_record+".png", dpi=300)
 
 
             if self.state == RECORD:
@@ -167,42 +168,44 @@ class RecordedDatas(DeviceMonitorFilterBase):
             df.set_index('time')
         return df
 
-
+    @mpl.rc_context({'backend': 'agg'}) # use non-interactive plot backend
     def plot_df(self, df):
-        """ plot dataframe in 3 different axes
-        first axes are voltages
-        second axe are currents
-        third are others...
-        by convention we begin column name with 'V' when it is voltage
-        we begin column name with 'I' when it is current
+        """ plot dataframe
         """
-        fig, axs = plt.subplots(2, 1) # warning: squeeze=True!
-        tics = np.arange(len(df))
+        # Signals dispatch in plot rows:
+        layout = [
+            ['Vgrid_a', 'Vgrid_b', 'Vgrid_c'],
+            ['Vgrid_alpha', 'Vgrid_beta', 'Vgrid_d', 'Vgrid_q'],
+            ['Ia', 'Ib', 'Ic'],
+            ['Id', 'Iq'],
+            ['freq'],
+            ['angle']
+        ]
+        if 'duty_a' in df:
+            layout.insert(2, ['duty_a', 'duty_b', 'duty_c'])
+        if 'Vinv_a' in df:
+            layout.insert(2, ['Vinv_a', 'Vinv_b', 'Vinv_c'])
+
+        nrows = len(layout)
+        print(f'Plot record with {nrows} rows')
+
+        fig, axs = plt.subplots(nrows, 1, sharex=True, figsize=(6, 3+1*nrows)) # warning: squeeze=True effect when nrows=1!
+
         if 'time' in df.columns:
-            print('time used in plot')
-            tics = df.time*1000 # s to ms
-        # try:
-        #     df["V_Low_estim"] = df["duty_cycle"] * df["V_high"]
-        # except:
-        #     pass
-        # if "k_acquire" in df:
-        #     del df["k_acquire"]
+            t = df.time*1000 # s to ms
+            axs[-1].set_xlabel('time (ms)')
+        else:
+            t = np.arange(len(df))
+            axs[-1].set_xlabel('time (samples)')
 
-        # for s in df:
-        #     if s.startswith("V"):
-        #         axs[0].step(tics, df[s], label=s)
-        #     elif s.startswith("I"):
-        #         axs[1].step(tics, df[s], label=s)
-        #     else:
-        #         axs[2].step(tics, df[s], label=s)
-        for s in df:
-            print(f'plotting {s}...')
-            if s == 'time':
-                continue
-            else:
-                axs[0].plot(tics, df[s], '-+', label=s)
+        for i, ax in enumerate(axs):
+            for s in df:
+                if not s in layout[i]:
+                    continue
+                ax.plot(t, df[s], 'o-', ms=2, label=s)
 
-        for ax in axs:
-            ax.legend()
-            ax.grid()
+            ax.legend(loc='upper right')
+            ax.grid(True)
+
+        fig.tight_layout()
         return fig
