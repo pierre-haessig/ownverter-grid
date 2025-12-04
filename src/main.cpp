@@ -126,7 +126,7 @@ static bool over_current_flag; // memory flag for overcurrent
 static bool V_dc_low_flag; // memory flag for low V_high event
 
 /* --- Grid synchronization (PLL) variables --- */
-static bool pll_on = false; // ENABLE/DISABLE grid frequency tracking. If false, w=w0
+static bool pll_on = true; // ENABLE/DISABLE grid frequency tracking. If false, w=w0
 
 // PLL state (frequency & phase)
 const  float32_t GRID_FREQ0 = 50.0; // nominal grid frequency (Hz)
@@ -173,7 +173,7 @@ static bool dump_scope_req; // request dump of scope data
 
 /* Scope triggering function: return true to start acquisition */
 bool scope_trigger() {
-	return pll_on;
+	return control_mode == POWER_ST;
 }
 
 /* Scope channels and trigger configuration
@@ -240,7 +240,7 @@ void print_scope_record() {
 void setup_PLL() {
 	/*State variables*/
 	grid_angle = 0.0;
-	pll_on = false;
+	pll_on = true;
 	pll_synced = false;
 	pll_unsync_flag = false;
 	pll_sync_counter = 0;
@@ -251,16 +251,12 @@ void setup_PLL() {
 	pi_pll.reset(0.0); // init frequency w=w0
 }
 
-/* Update PLL state and frequency
-
-TO BE CHANGED;
-
-*/
+/* Update PLL state and frequency */
 inline void run_grid_PLL() {
 	if (pll_on) {
 		// PLL frequency update
-		float32_t grid_deltaw = 0.0; // FREQUENCY DEVIATION DYNAMICS FORMULA TO BE IMPLEMENTED
-		grid_w = 0.0 + grid_deltaw; // FREQUENCY FORMULA TO BE CHANGED
+		float32_t grid_deltaw = pi_pll.calculateWithReturn(0.0f, -Vg_dq.q); // Delta w. use -Vq as measurement so that process error = +Vq
+		grid_w = GRID_W0 + grid_deltaw;
 		// PLL status monitor
 		pll_phase_ok = Vg_dq.q < PLL_VQ_SYNC_TOLERANCE && Vg_dq.q > -PLL_VQ_SYNC_TOLERANCE; // instantaneous PLL phase error below tolerance
 		pll_freq_ok = grid_deltaw < PLL_DELTAW_SYNC_TOLERANCE && grid_deltaw > -PLL_DELTAW_SYNC_TOLERANCE;
@@ -300,7 +296,7 @@ inline void run_grid_PLL() {
 		pi_pll.reset(0.0);
 	}
 	// update angle (always, no matter PLL ON/OFF status)
-	grid_angle = 0.0; // ANGLE DYNAMICS FORMULA TO BE IMPLEMENTED
+	grid_angle = ot_modulo_2pi(grid_angle + grid_w*T_control);
 	// Hz frequency output
 	grid_freq = grid_w/(2*PI);
 }
@@ -579,20 +575,16 @@ void clear_error_flags() {
 
 /* Compute inverter voltage.
 
-TO BE CHANGED
-
 In this open loop version, it is juste equal Vd set point.
 In close loop current control version, it will depend on the current set point and measurement */
 void compute_inverter_voltages(float32_t grid_angle) {
 	Vi_dq.d = Vi_ref;
 	Vi_dq.q = 0.0F;
 	// Transform back to abc
-	// Vi_abc = ...; // CONVERSION TO BE IMPLEMENTED
+	Vi_abc = Transform::to_threephase(Vi_dq, grid_angle);
 }
 
 /* Convert inverter leg voltage to duty cycle, including saturation
-
-TO BE CHANGED
 
 Leg voltage in the [-Vdc/2, +Vdc/2] interval is mapped to [0,1],
 meaning that the duty cycle offset is added automatically.
@@ -600,7 +592,8 @@ meaning that the duty cycle offset is added automatically.
 inline float32_t voltage_to_duty(float32_t Vleg, float32_t inverse_Vhigh)
 {
 	static float32_t duty_raw;
-	duty_raw = 0.0; // FORMULA TO BE CHANGED
+	const float32_t duty_offset = 0.5F;
+	duty_raw = Vleg * inverse_Vhigh + duty_offset;
 	if (duty_raw > 1.0F) {
 		return 1.0F;
 	}
