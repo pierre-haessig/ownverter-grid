@@ -175,9 +175,9 @@ class RecordedDatas(DeviceMonitorFilterBase):
         # Signals dispatch in plot rows:
         layout = [
             ['Vgrid_a', 'Vgrid_b', 'Vgrid_c'],
-            ['Vgrid_alpha', 'Vgrid_beta', 'Vgrid_d', 'Vgrid_q'],
+            ['Vgrid_d', 'Vgrid_q'],
             ['Ia', 'Ib', 'Ic'],
-            ['Id', 'Iq'],
+            ['Id', 'Iq', 'Id*', 'Iq*'],
             ['freq'],
             ['angle']
         ]

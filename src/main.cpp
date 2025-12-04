@@ -93,10 +93,6 @@ static LowPassFirstOrderFilter vdc_filter = controlLibFactory.lowpassfilter(T_co
 static float32_t V_dc_filt; // DC bus voltage, lowpass filtered (V)
 static float32_t inv_V_dc_filt; // 1/Vdc, with a 1/V_DC_MIN bound
 
-
-float32_t Vi_ref = 0.0;// Inverter d-voltage reference (V)
-const float32_t VI_STEP = 1.0; // Inverter voltage step (V)
-
 /* --- Power control & safety monitoring variables  --- */
 
 /* Operation mode control (state machine) */
@@ -158,6 +154,18 @@ const float32_t KI_PLL = (WN_PLL * WN_PLL) / GRID_VPK; // Integral feedback gain
 const float32_t TI_PLL = KP_PLL / KI_PLL; // Integral feedback time constant (s)
 static Pid pi_pll; // PI feedback filter of the PLL
 
+/* --- Current controller: two PI controllers in the dq reference frame (one per channel) --- */
+
+// Current control referencess
+static dqo_t Idq_ref; // dq current references (A)
+const float32_t I_STEP = 0.5; // Current reference step (A)
+
+// Controller parameters: fixed PI tuning
+const float32_t KP_CURRENT = 0.016F; // Proportional feedback gain (V/A)
+const float32_t TI_CURRENT = 6.3e-4F; // Integral feedback time constant (s)
+const float32_t VG_FF = GRID_VPK; // Feedforward grid voltage amplitude (V).
+static Pid pi_current_d, pi_current_q; // PI current controllers for d and q channels
+
 /* --- Scope, to record over time the value of selected variables --- */
 
 // Scope variables and parameters
@@ -173,26 +181,22 @@ static bool dump_scope_req; // request dump of scope data
 
 /* Scope triggering function: return true to start acquisition */
 bool scope_trigger() {
-	return control_mode == POWER_ST;
+	// return Idq_ref.d >= 1.0; // trigger on Id current reference transient
+	return control_mode == POWER_ST; // trigger on POWER start up
 }
 
 /* Scope channels and trigger configuration
 
-with number of channels:
-- all channels: 1+7+10+3+2 = 23
-- no inverter voltages and duties: 1+7+5+2 = 15
+with number of channels: 1+5+5+2+5+3+2 = 23
 */
 void setup_scope() {
 	// DC bus voltage (1 ch)
 	scope.connectChannel(V_dc, "Vdc");
 
-	// Grid voltages (7 ch)
+	// Grid voltages (5 ch)
 	scope.connectChannel(Vg_abc.a, "Vgrid_a");
 	scope.connectChannel(Vg_abc.b, "Vgrid_b");
 	scope.connectChannel(Vg_abc.c, "Vgrid_c");
-
-	scope.connectChannel(Vg_clarke.alpha, "Vgrid_alpha");
-	scope.connectChannel(Vg_clarke.beta, "Vgrid_beta");
 	scope.connectChannel(Vg_dq.d, "Vgrid_d");
 	scope.connectChannel(Vg_dq.q, "Vgrid_q");
 
@@ -202,18 +206,21 @@ void setup_scope() {
 	scope.connectChannel(Iabc.c, "Ic");
 	scope.connectChannel(Idq.d, "Id");
 	scope.connectChannel(Idq.q, "Iq");
+	// Inverter current references (2 ch)
+	scope.connectChannel(Idq_ref.d, "Id*");
+	scope.connectChannel(Idq_ref.q, "Iq*");
 
 	// Inverter voltages (5 ch)
-	// scope.connectChannel(Vi_abc.a, "Vinv_a");
-	// scope.connectChannel(Vi_abc.b, "Vinv_b");
-	// scope.connectChannel(Vi_abc.c, "Vinv_c");
-	// scope.connectChannel(Vi_dq.d, "Vinv_d");
-	// scope.connectChannel(Vi_dq.q, "Vinv_q");
+	scope.connectChannel(Vi_abc.a, "Vinv_a");
+	scope.connectChannel(Vi_abc.b, "Vinv_b");
+	scope.connectChannel(Vi_abc.c, "Vinv_c");
+	scope.connectChannel(Vi_dq.d, "Vinv_d");
+	scope.connectChannel(Vi_dq.q, "Vinv_q");
 
-	// // Duty cycles (3 ch)
-	// scope.connectChannel(duty_abc.a, "duty_a");
-	// scope.connectChannel(duty_abc.b, "duty_b");
-	// scope.connectChannel(duty_abc.c, "duty_c");
+	// Duty cycles (3 ch)
+	scope.connectChannel(duty_abc.a, "duty_a");
+	scope.connectChannel(duty_abc.b, "duty_b");
+	scope.connectChannel(duty_abc.c, "duty_c");
 
 	// PLL variables (2 ch)
 	scope.connectChannel(grid_freq, "freq");
@@ -303,6 +310,15 @@ inline void run_grid_PLL() {
 
 /* -------------- SETUP FUNCTION -------------------------------*/
 
+/* Setup current control */
+void setup_current_control() {
+	pi_current_d = controlLibFactory.pid(T_control, KP_CURRENT, TI_CURRENT, 0.0, 0.0, -V_DC-VG_FF, V_DC-VG_FF);
+	pi_current_q = controlLibFactory.pid(T_control, KP_CURRENT, TI_CURRENT, 0.0, 0.0, -V_DC, V_DC);
+	// Initial current references
+	Idq_ref.d = 0.0F;
+	Idq_ref.q = 0.0F;
+}
+
 /**
  * Main setup routine, called at board startup.
  * It is used to initialize the board (spin microcontroller and power shield)
@@ -322,6 +338,7 @@ void setup_routine()
 
 	setup_scope();
 	setup_PLL();
+	setup_current_control();
 
 	/* Declare tasks */
 	uint32_t app_task_number = task.createBackground(status_display_task);
@@ -349,14 +366,17 @@ void clear_error_flags();
 void user_interface_task()
 {
 	// Task content
+	float32_t I_desired; // desired current reference after Increase/Decrease
 	received_serial_char = console_getchar();
+
 	switch (received_serial_char) {
 	case 'h':
 		printk("Command help\n");
 		printk("- p/i: Request Power/Idle mode change\n");
 		printk("- a:   Clear (Acknowledge) power error flags\n");
 		printk("- l:   Toggle PLL ON/OFF\n");
-		printk("- u/j: Increase/Decrease voltage reference by (%.1f) V\n", (double)VI_STEP);
+		printk("- u/j: Increase/Decrease Id reference by (%.1f) V\n", (double)I_STEP);
+		printk("- y/n: Increase/Decrease Iq reference by (%.1f) V\n", (double)I_STEP);
 		printk("- s:   Retreive latest scope data\n");
 		printk("- r:   Relaunch scope acquisition\n");
 		break;
@@ -381,12 +401,24 @@ void user_interface_task()
 		break;
 	// Setpoint changes
 	case 'u':
-		printk("Voltage reference UP\n");
-		Vi_ref += VI_STEP;
+		printk("Id reference UP\n");
+		I_desired = Idq_ref.d + I_STEP;
+		Idq_ref.d = I_desired <= AC_CURRENT_LIMIT ? I_desired : AC_CURRENT_LIMIT;
         break;
     case 'j':
-		printk("Voltage reference DOWN\n");
-        Vi_ref -= VI_STEP;
+		printk("Id reference DOWN\n");
+        I_desired = Idq_ref.d - I_STEP;
+		Idq_ref.d = I_desired >= -AC_CURRENT_LIMIT ? I_desired : -AC_CURRENT_LIMIT;
+        break;
+	case 'y':
+		printk("Iq reference UP\n");
+		I_desired = Idq_ref.q + I_STEP;
+		Idq_ref.q = I_desired <= AC_CURRENT_LIMIT ? I_desired : AC_CURRENT_LIMIT;
+        break;
+    case 'n':
+		printk("Iq reference DOWN\n");
+        I_desired = Idq_ref.q - I_STEP;
+		Idq_ref.q = I_desired >= -AC_CURRENT_LIMIT ? I_desired : -AC_CURRENT_LIMIT;
         break;
 	// Scope
 	case 's':
@@ -431,9 +463,9 @@ void status_display_task()
 	// PLL display:
 	printk("PLL %s (%s %.1f Hz) | ", pll_on ? "ON ":"OFF", pll_synced ? "SYNCED":"UNSYNC", (double) grid_freq);
 	// Display various measurements
-	printk("Vref %4.1f V, ", (double) Vi_ref);
 	printk("Vgd %4.1f V, ", (double) Vg_dq.d);
-	printk("Idq %5.1f,%5.1f A, ", (double)Idq.d, (double)Idq.d);
+	printk("Idq* %4.1f,%4.1f A, ", (double)Idq_ref.d, (double)Idq_ref.d);
+	printk("Idq %4.1f,%4.1f A, ", (double)Idq.d, (double)Idq.d);
 	printk("Vdc %4.1f V, ", (double) V_dc);
 	printk("Idc %4.1f A | ", (double) I_dc);
 	// Scope
@@ -573,13 +605,15 @@ void clear_error_flags() {
 	pll_unsync_flag = false;
 }
 
-/* Compute inverter voltage.
+/* Compute inverter voltage from current_control.
 
-In this open loop version, it is juste equal Vd set point.
-In close loop current control version, it will depend on the current set point and measurement */
-void compute_inverter_voltages(float32_t grid_angle) {
-	Vi_dq.d = Vi_ref;
-	Vi_dq.q = 0.0F;
+In this closed loop current control application, inverter voltage
+results from feeding current set point and measurement through PI controllers */
+void compute_current_control(float32_t grid_angle) {
+	// DQ PI control, with grid voltage feed forward:
+	Vi_dq.d = pi_current_d.calculateWithReturn(Idq_ref.d, Idq.d) + VG_FF;
+	Vi_dq.q = pi_current_q.calculateWithReturn(Idq_ref.q, Idq.q) + 0.0f;
+	Vi_dq.o = 0.0F;
 	// Transform back to abc
 	Vi_abc = Transform::to_threephase(Vi_dq, grid_angle);
 }
@@ -681,7 +715,7 @@ void control_task() {
 			}
 			break;
 		case POWER_ST:
-			compute_inverter_voltages(grid_angle);
+			compute_current_control(grid_angle);
 			compute_duties();
 			apply_duties();
 			// Start power if it's OFF
