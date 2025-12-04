@@ -1,18 +1,21 @@
-# OwnVerter application: islanded inverter with grid synchronization
+# OwnVerter application: grid connected inverter
 
-This repository host embedded microcontroller code for using the [OwnTech OwnVerter](https://www.owntech.io/ownverter/) board as an **islanded three-phase inverter**, that is *not* grid connected, but instead feeding a three-phase load (R, RL...).
+This repository host embedded microcontroller code for using the [OwnTech OwnVerter](https://www.owntech.io/ownverter/) board as a **grid connected three-phase inverter**, with closed loop **current control** (d and q current regulation). It is a grid following control using a PLL for grid synchronization.
 
-However, compared to https://github.com/pierre-haessig/ownverter-islanded, it adds ability to **synchronize to the grid**, with grid voltages measurement + **PLL**. Still, no power is exchanged with the grid.
+This code is very similar to https://github.com/pierre-haessig/ownverter-sync, which already contains the PLL for grid synchronization, but feeds an islanded load. This application adds the closed loop current control.
 
-Remark: the "islanded" qualifier may be a bit misleading. Here it means that the inverter works in the simplest operation mode: **open loop** (no regulation), simply generating a three-phase voltages of given frequency and amplitude.
+This code is used in the context of a power electronics course at CentralSupélec, Rennes campus: [http://éole.net/courses/onduleur/](http://éole.net/courses/onduleur/) (in French). List of code repositories of the lab series:
 
-This code is used in the context of a power electronics course at CentralSupélec, Rennes campus: [http://éole.net/courses/onduleur/](http://éole.net/courses/onduleur/) (in French).
+1. DC/DC converter: https://github.com/pierre-haessig/ownverter-dcdc
+2. Islanded inverter (autonomous operation): https://github.com/pierre-haessig/ownverter-islanded
+3. Islanded inverter with grid synchronization: https://github.com/pierre-haessig/ownverter-sync
+4. **Grid connected inverter**: https://github.com/pierre-haessig/ownverter-grid (here)
 
 ## Experiment schematics
 
 Wiring diagram:
 
-![wiring diagram of the inverter](images/ownverter_wiring_inverter_load-grid-sync.png)
+![wiring diagram of the inverter](images/ownverter_wiring_inverter_grid.png)
 
 ## Usage
 
