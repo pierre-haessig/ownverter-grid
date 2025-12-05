@@ -183,6 +183,8 @@ class RecordedDatas(DeviceMonitorFilterBase):
         ]
         if 'duty_a' in df:
             layout.insert(2, ['duty_a', 'duty_b', 'duty_c'])
+        if 'Vinv_d' in df:
+            layout.insert(2, ['Vinv_d', 'Vinv_q'])
         if 'Vinv_a' in df:
             layout.insert(2, ['Vinv_a', 'Vinv_b', 'Vinv_c'])
 

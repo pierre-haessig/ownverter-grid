@@ -170,7 +170,7 @@ static Pid pi_current_d, pi_current_q; // PI current controllers for d and q cha
 
 // Scope variables and parameters
 const uint16_t SCOPE_LENGTH = 200; // number of instants to record
-const uint32_t SCOPE_CHANNELS = 15; // number of variables to record (needs to be coherent with setup_scope!)
+const uint32_t SCOPE_CHANNELS = 23; // number of variables to record (needs to be coherent with setup_scope!)
 const uint32_t SCOPE_DECIMATION = 2; // acquisition rate decimation, with respect to control task period
 const float32_t SCOPE_PRETRIG = 5.0/40.0; // record 12.5% samples before trigger (5 ms)
 
@@ -464,7 +464,7 @@ void status_display_task()
 	printk("PLL %s (%s %.1f Hz) | ", pll_on ? "ON ":"OFF", pll_synced ? "SYNCED":"UNSYNC", (double) grid_freq);
 	// Display various measurements
 	printk("Vgd %4.1f V, ", (double) Vg_dq.d);
-	printk("Idq* %4.1f,%4.1f A, ", (double)Idq_ref.d, (double)Idq_ref.d);
+	printk("Idq* %4.1f,%4.1f A, ", (double)Idq_ref.d, (double)Idq_ref.q);
 	printk("Idq %4.1f,%4.1f A, ", (double)Idq.d, (double)Idq.d);
 	printk("Vdc %4.1f V, ", (double) V_dc);
 	printk("Idc %4.1f A | ", (double) I_dc);
@@ -598,8 +598,9 @@ inline bool monitor_power() {
 	return  !V_dc_low && !over_current; // PLL sync requirement removed from power_ok
 }
 
-/* Clear power and PLL error flags */
+/* Clear power and PLL error flags and delay timers */
 void clear_error_flags() {
+	over_current_counter = 0;
 	over_current_flag = false;
 	V_dc_low_flag = false;
 	pll_unsync_flag = false;
